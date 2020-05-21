@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
+#include <assert.h>
 
 #define BLOCK_SIZE 16
 
@@ -41,14 +42,18 @@ __global__ void matMult(float *A, size_t pitchA, float *B, size_t pitchB,
 
     float sum = 0.0f;
 
+    float *rowA = (float *)((char *) A + pitchA * BLOCK_SIZE * by + pitchA * ty);
+    float *rowB = (float *)((char *) B + sizeof(float) * BLOCK_SIZE * bx + pitchB * ty);
+    
     for (int ia = aBegin, ib = bBegin; ia <= aEnd; ia += aStep, ib += bStep) {
         __shared__ float as[BLOCK_SIZE][BLOCK_SIZE];
         __shared__ float bs[BLOCK_SIZE][BLOCK_SIZE];
-
-        float *rowA = (float *)((char *) A + pitchA * ty);
-        float *rowB = (float *)((char *) B + pitchB * ty);
-        as[ty][tx] = rowA[ia + tx];
-        bs[ty][tx] = rowB[ib + tx];
+    
+        as[ty][tx] = rowA[tx];
+        // A[ia + N * ty + tx] = [глобальный индекс начала + индекс строки + столбец]
+        bs[ty][tx] = rowB[tx];
+        rowA = (float *)((char *) rowA + BLOCK_SIZE * sizeof(float));
+        rowB = (float *)((char *) rowB + BLOCK_SIZE * pitchB);
 
         __syncthreads();
         for (int k = 0; k < BLOCK_SIZE; ++k) {
@@ -58,8 +63,11 @@ __global__ void matMult(float *A, size_t pitchA, float *B, size_t pitchB,
     }
 
     int ic = N * BLOCK_SIZE * by + BLOCK_SIZE * bx;
-    float *rowC = (float *)((char *) C + pitchC * ty);
-    rowC[ic + tx] = sum;
+    float *rowC = (float *)((char *) C + pitchC * BLOCK_SIZE * by + BLOCK_SIZE * bx * sizeof(float) + pitchC * ty);
+    if (abs(sum - 3160) < 0.001f) {
+        printf("HERE\n");
+    }
+    rowC[tx] = sum;
 }
 
 int main(int argc, char **argv) {
@@ -110,6 +118,8 @@ int main(int argc, char **argv) {
     
     dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE);
     dim3 numBlocks(N / threadsPerBlock.x, N / threadsPerBlock.y);
+    printf("Threads per block: (%d, %d)\n", threadsPerBlock.x, threadsPerBlock.y);
+    printf("Num blocks: (%d, %d)\n", numBlocks.x, numBlocks.y);
 
     fill_random<<<numBlocks, threadsPerBlock>>>(ADev, N, pitchA);
     matMult<<<numBlocks, threadsPerBlock>>>(ADev, pitchA, ADev, pitchA, CDev, pitchC, N);
@@ -154,6 +164,7 @@ int main(int argc, char **argv) {
     printf("right:\n");
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
+            assert(C[i * N + j] == C2[i * N + j]);
             printf("%3.0f ", C2[i * N + j]);
         }
         printf("\n");
