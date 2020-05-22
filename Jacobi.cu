@@ -50,8 +50,8 @@ __global__ void matMult(float *A, size_t pitchA, float *B, size_t pitchB,
         __shared__ float bs[BLOCK_SIZE][BLOCK_SIZE];
     
         as[ty][tx] = rowA[tx];
-        // A[ia + N * ty + tx] = [глобальный индекс начала + индекс строки + столбец]
         bs[ty][tx] = rowB[tx];
+
         rowA = (float *)((char *) rowA + BLOCK_SIZE * sizeof(float));
         rowB = (float *)((char *) rowB + BLOCK_SIZE * pitchB);
 
@@ -62,12 +62,54 @@ __global__ void matMult(float *A, size_t pitchA, float *B, size_t pitchB,
         __syncthreads();
     }
 
-    int ic = N * BLOCK_SIZE * by + BLOCK_SIZE * bx;
-    float *rowC = (float *)((char *) C + pitchC * BLOCK_SIZE * by + BLOCK_SIZE * bx * sizeof(float) + pitchC * ty);
-    if (abs(sum - 3160) < 0.001f) {
-        printf("HERE\n");
-    }
+    float *rowC = (float *)((char *) C + pitchC * BLOCK_SIZE * by +
+        BLOCK_SIZE * bx * sizeof(float) + pitchC * ty);
     rowC[tx] = sum;
+}
+
+void matVecMultClassic(float *A, float *b, float *c, size_t N) {
+    for (int i = 0; i < N; i++) {
+        c[i] = 0.0f;
+        for (int j = 0; j < N; j++) {
+            c[i] += A[i * N + j] * b[j];
+        }
+    }
+}
+
+// A * b = c
+__global__ void matVecMult(float *A, size_t pitch, float *b, float *c, size_t N) {
+    int bx = blockIdx.x;
+    int by = blockIdx.y;
+
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+
+    int aBegin = N * BLOCK_SIZE * by;
+    int aEnd = aBegin + N - 1;
+
+    int aStep = BLOCK_SIZE;
+    
+    float *rowA = (float *)((char *) A + pitch * BLOCK_SIZE * by + pitch * ty);
+    float *rowB = b;
+    float sum = 0.0f;
+    for (int ia = aBegin; ia <= aEnd; ia += aStep) {
+        __shared__ float as[BLOCK_SIZE][BLOCK_SIZE];
+        __shared__ float bs[BLOCK_SIZE];
+        
+        as[ty][tx] = rowA[tx];
+        bs[ty] = rowB[ty];
+        __syncthreads();
+
+        rowA = (float *)((char *) rowA + BLOCK_SIZE * sizeof(float));
+        rowB += BLOCK_SIZE;
+        __syncthreads();
+        
+        for (int k = 0; k < BLOCK_SIZE; k++) {
+            sum += as[ty][k] * bs[k];
+        }
+    }
+    float *rowC = c + BLOCK_SIZE * by;
+    rowC[ty] = sum;
 }
 
 int main(int argc, char **argv) {
@@ -96,9 +138,10 @@ int main(int argc, char **argv) {
     float *C2 = new float[N * N];
     float *f = new float[N];
     float *x = new float[N];
+    float *x2 = new float[N];
     for (int i = 0; i < N; i++) {
         f[i] = i;
-        x[i] = 0;
+        x[i] = x2[i] = 0;
     }
 
     for (int i = 0; i < N; i++) {
@@ -122,7 +165,8 @@ int main(int argc, char **argv) {
     printf("Num blocks: (%d, %d)\n", numBlocks.x, numBlocks.y);
 
     fill_random<<<numBlocks, threadsPerBlock>>>(ADev, N, pitchA);
-    matMult<<<numBlocks, threadsPerBlock>>>(ADev, pitchA, ADev, pitchA, CDev, pitchC, N);
+    //matMult<<<numBlocks, threadsPerBlock>>>(ADev, pitchA, ADev, pitchA, CDev, pitchC, N);
+    matVecMult<<<numBlocks, threadsPerBlock>>>(ADev, pitchA, fDev, xDev, N);
 
     cudaMemcpy2D(A, N * sizeof(float), ADev, pitchA, N * sizeof(float), N, cudaMemcpyDeviceToHost);
     cudaMemcpy2D(C, N * sizeof(float), CDev, pitchC, N * sizeof(float), N, cudaMemcpyDeviceToHost);
@@ -145,16 +189,17 @@ int main(int argc, char **argv) {
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
-    mult(A, A, C2, N);
+    //mult(A, A, C2, N);
+    matVecMultClassic(A, f, x2, N);
 
     printf("Elapsed time: %.2f ms\n", gpuTime);
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             printf("%3.0f ", A[i * N + j]);
         }
-        printf("| %3.0f\n", f[i]);
+        printf("| %3.0f {%3.0f | %3.0f}\n", f[i], x2[i], x[i]);
     }
-    printf("multiply:\n");
+    /*printf("multiply:\n");
     for (int i = 0; i < N; i++) {
         for (int j = 0; j < N; j++) {
             printf("%3.0f ", C[i * N + j]);
@@ -168,7 +213,7 @@ int main(int argc, char **argv) {
             printf("%3.0f ", C2[i * N + j]);
         }
         printf("\n");
-    }
+    }*/
     delete A;
     delete f;
     delete x;
