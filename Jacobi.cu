@@ -5,7 +5,7 @@
 #include <curand.h>
 
 #define EPS 0.0000001f
-#define BLOCK_SIZE 4
+#define BLOCK_SIZE 8
 
 #define CUDA_CALL(x) do { if((x)!=cudaSuccess) { \
     printf("[CUDA ERROR]: Error at %s:%d. ",__FILE__,__LINE__);\
@@ -297,7 +297,7 @@ int main(int argc, char **argv) {
     printf("BLOCK_SIZE: %d\n", BLOCK_SIZE);
     printf("Given matrix size: %d\n", N);
 
-    /// Round up to the next multiple of BLOCK_SIZE.
+    // Round up to the next multiple of BLOCK_SIZE.
     if (N % BLOCK_SIZE != 0) {
         printf("[WARNING]: current matrix size is not a multiple of BLOCK_SIZE. "
                "It will be round to the next multiple of BLOCK_SIZE.\n");
@@ -345,6 +345,7 @@ int main(int argc, char **argv) {
     curandGenerateUniform(gen, randDev, N * N);
 
     fillRandom<<<numBlocks, threadsPerBlock>>>(ADev, N, pitchA, randDev);
+
     curandDestroyGenerator(gen);
     cudaFree(randDev);
 
