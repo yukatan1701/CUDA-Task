@@ -2,8 +2,7 @@
 #include <cstdlib>
 #include <cuda.h>
 #include <cuda_runtime_api.h>
-#include <assert.h>
-#include <limits>
+#include <curand.h>
 
 #define EPS 0.0000001f
 #define BLOCK_SIZE 4
@@ -45,12 +44,12 @@ void printVectorDev(float *vDev, int N) {
     delete v;
 }
 
-__global__ void fillRandom(float *A, int N, size_t pitch) {
+__global__ void fillRandom(float *A, int N, size_t pitch, float *rand) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
-    //A[j + N * i] = i + j;
     float *row = (float *)((char *) A + i * pitch);
-    row[j] = i + j + 1;
+    //row[j] = i + j + 1;
+    row[j] = rand[i * N + j];
     atomicAdd(&row[i], row[j] * 10.0f);
 }
 
@@ -271,6 +270,7 @@ void findSolution(float *ADev, size_t pitchA, float *f, float *x, int N,
         if (Norm < EPS) {
             break;
         }
+        //printf("step: %d (%.7f)\n", steps, Norm);
         if (isnan(Norm) || isinf(Norm)) {
             printf("ERROR: System solution diverges. Please check if your "
                    "matrix is diagonal dominant.\n");
@@ -335,7 +335,19 @@ int main(int argc, char **argv) {
            threadsPerBlock.x, threadsPerBlock.y);
     printf("Num blocks: (%d, %d)\n", numBlocks.x, numBlocks.y);
 
-    fillRandom<<<numBlocks, threadsPerBlock>>>(ADev, N, pitchA);
+    curandGenerator_t gen;
+    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_XORWOW);
+    unsigned long long clock = 1234ULL;
+    curandSetPseudoRandomGeneratorSeed(gen, clock);
+    printf("Seed: %llu\n", clock);
+    float *randDev;
+    CUDA_CALL(cudaMalloc((void **) &randDev, N * N * sizeof(float)));
+    curandGenerateUniform(gen, randDev, N * N);
+
+    fillRandom<<<numBlocks, threadsPerBlock>>>(ADev, N, pitchA, randDev);
+    curandDestroyGenerator(gen);
+    cudaFree(randDev);
+
     findSolution(ADev, pitchA, f, x, N, threadsPerBlock, numBlocks);
 
     CUDA_CALL(cudaEventRecord(stop, 0));
