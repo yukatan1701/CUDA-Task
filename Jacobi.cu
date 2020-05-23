@@ -4,8 +4,9 @@
 #include <cuda_runtime_api.h>
 #include <assert.h>
 #include <limits>
+#define EPS 0.00001f
 
-#define BLOCK_SIZE 16
+#define BLOCK_SIZE 4
 
 void printMatrix(float *A, int N) {
     for (int i = 0; i < N; i++) {
@@ -16,12 +17,26 @@ void printMatrix(float *A, int N) {
     }
 }
 
+void printMatrixDev(float *ADev, size_t pitch, int N) {
+    float *A = new float[N * N];
+    cudaMemcpy2D(A, N * sizeof(float), ADev, pitch, N * sizeof(float), N, cudaMemcpyDeviceToHost);
+    printMatrix(A, N);
+    delete A;
+}
+
 void printVector(float *v, int N) {
     printf("[");
     for (int i = 0; i < N; i++) {
-        printf("%.2f ", v[i]);
+        printf("%.7f ", v[i]);
     }
     printf("]\n");
+}
+
+void printVectorDev(float *vDev, int N) {
+    float *v = new float[N];
+    cudaMemcpy(v, vDev, N * sizeof(float), cudaMemcpyDeviceToHost);
+    printVector(v, N);
+    delete v;
 }
 
 __global__ void fillRandom(float *A, int N, size_t pitch) {
@@ -30,6 +45,7 @@ __global__ void fillRandom(float *A, int N, size_t pitch) {
     //A[j + N * i] = i + j;
     float *row = (float *)((char *) A + i * pitch);
     row[j] = i + j + 1;
+    atomicAdd(&row[i], row[j]);
 }
 
 void mult(float *A, float *B, float *C, size_t N) {
@@ -85,7 +101,7 @@ __global__ void matMult(float *A, size_t pitchA, float *B, size_t pitchB,
     rowC[tx] = sum;
 }
 
-void matVecMultClassic(float *A, float *b, float *c, size_t N) {
+void multMatVecClassic(float *A, float *b, float *c, size_t N) {
     for (int i = 0; i < N; i++) {
         c[i] = 0.0f;
         for (int j = 0; j < N; j++) {
@@ -96,7 +112,7 @@ void matVecMultClassic(float *A, float *b, float *c, size_t N) {
 
 // C = A - B
 __global__ void matDiff(float *A, size_t pitchA, float *B, size_t pitchB,
-                        float *C, size_t pitchC, int N) {
+                        float *C, size_t pitchC) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
     float *rowA = (float *)((char *) A + i * pitchA);
@@ -106,8 +122,8 @@ __global__ void matDiff(float *A, size_t pitchA, float *B, size_t pitchB,
 }
 
 // C = D * A, where D is diagonal matrix
-__global__ void diagMatAndMatMult(float *D, size_t pitchD, float *A, size_t pitchA,
-                                  float *C, size_t pitchC, int N) {
+__global__ void multDiagMatAndMat(float *D, size_t pitchD, float *A, size_t pitchA,
+                                  float *C, size_t pitchC) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -117,9 +133,9 @@ __global__ void diagMatAndMatMult(float *D, size_t pitchD, float *A, size_t pitc
     rowC[j] = rowA[j] * rowD[i];
 }
 
-// A * b = c
-__global__ void matVecMult(float *A, size_t pitch, float *b, float *c, size_t N) {
-    int bx = blockIdx.x;
+// A * b + g = c
+__global__ void multMatVecPlusVec(float *A, size_t pitch, float *b, float *g, float *c, size_t N) {
+    //int bx = blockIdx.x;
     int by = blockIdx.y;
 
     int tx = threadIdx.x;
@@ -150,11 +166,12 @@ __global__ void matVecMult(float *A, size_t pitch, float *b, float *c, size_t N)
         }
     }
     float *rowC = c + BLOCK_SIZE * by;
-    rowC[ty] = sum;
+    float *rowG = g + BLOCK_SIZE * by;
+    rowC[ty] = sum + rowG[ty];
 }
 
 // g = D * f
-__global__ void multDiagMatAndVec(float *D, size_t pitchD, float *f, float *g, int N) {
+__global__ void multDiagMatAndVec(float *D, size_t pitchD, float *f, float *g) {
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     int j = blockIdx.y * blockDim.y + threadIdx.y;
 
@@ -173,11 +190,95 @@ __global__ void invertDiagMat(float *D, size_t pitch) {
     }
 }
 
-void assertVectors(float *a, float *b, int N) {
-    float eps = std::numeric_limits<float>::epsilon();
-    for (int i = 0; i < N; i++) {
-        assert(abs(a[i] - b[i]) < eps);
+__global__ void getDiagMat(float *A, size_t pitchA, float *D, size_t pitchD) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    int j = blockIdx.y * blockDim.y + threadIdx.y;
+    float *rowA = (float *)((char *) A + i * pitchA);
+    float *rowD = (float *)((char *) D + i * pitchD);
+    if (i == j) {
+        rowD[j] = rowA[j];
+    } else {
+        rowD[j] = 0.0f;
     }
+}
+
+void assertVectors(float *a, float *b, int N) {
+    for (int i = 0; i < N; i++) {
+        assert(fabsf(a[i] - b[i]) < EPS);
+    }
+}
+
+float normOfDifference(float *a, float *b, int N) {
+    float sum = 0.0f;
+    for (int i = 0; i < N; i++) {
+        float val = a[i] - b[i];
+        sum += val * val;
+    }
+    return sqrtf(sum);
+}
+
+void findSolution(float *ADev, size_t pitchA, float *f, float *x, int N) {
+    float *fDev, *xDev, *xNextDev, *BDev, *DDev, *gDev, *DADiffDev;
+    size_t pitchB, pitchD, pitchDADiff;
+    cudaMallocPitch((void **) &BDev, &pitchB, N * sizeof(float), N);
+    cudaMallocPitch((void **) &DDev, &pitchD, N * sizeof(float), N);
+    cudaMallocPitch((void **) &DADiffDev, &pitchDADiff, N * sizeof(float), N);
+
+    dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE);
+    dim3 numBlocks(N / threadsPerBlock.x, N / threadsPerBlock.y);
+
+    getDiagMat<<<numBlocks, threadsPerBlock>>>(ADev, pitchA, DDev, pitchD);
+    matDiff<<<numBlocks, threadsPerBlock>>>(DDev, pitchD, ADev, pitchA, DADiffDev, pitchDADiff);
+    invertDiagMat<<<numBlocks, threadsPerBlock>>>(DDev, pitchD);
+    multDiagMatAndMat<<<numBlocks, threadsPerBlock>>>(DDev, pitchD, DADiffDev, pitchDADiff, BDev, pitchB);
+    
+    cudaFree(ADev);
+    cudaFree(DADiffDev);
+
+    cudaMalloc((void **) &fDev, N * sizeof(float));
+    cudaMemcpy(fDev, f, N * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMalloc((void **) &gDev, N * sizeof(float));
+    multDiagMatAndVec<<<numBlocks, threadsPerBlock>>>(DDev, pitchD, fDev, gDev);
+    printVectorDev(gDev, N);
+
+    cudaFree(DDev);    
+
+    float *xNext = new float[N];
+    cudaMalloc((void **) &xNextDev, N * sizeof(float));
+    cudaMalloc((void **) &xDev, N * sizeof(float));
+    cudaMemcpy(xDev, x, N * sizeof(float), cudaMemcpyHostToDevice);
+
+    //float *BxDev;
+    //cudaMalloc((void **) &BxDev, N * sizeof(float));
+    int i = 0;
+    float nnorm;
+    while (true) {
+        multMatVecPlusVec<<<numBlocks, threadsPerBlock>>>(BDev, pitchB, xDev, gDev, xNextDev, N);
+        //xNextDev = B * xDev + g;
+        //printf("----------\n");
+        //printVectorDev(xDev, N);
+        //printVectorDev(xNextDev, N);
+        cudaMemcpy(x, xDev, N * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(xNext, xNextDev, N * sizeof(float), cudaMemcpyDeviceToHost);
+        // copy xDev and xNextDev to host
+        // find norm of difference
+        // copy xNextDev to xDev
+        nnorm = normOfDifference(xNext, x, N);
+        //printf("Step: %d (%.5f)\n", i, nnorm);
+        i++;
+        if (nnorm < EPS) {
+            break;
+        }
+        cudaMemcpy(xDev, xNextDev, N * sizeof(float), cudaMemcpyDeviceToDevice);
+    }
+    // copy xNext to x
+    printVector(xNext, N);
+    cudaMemcpy(x, xNext, N * sizeof(float), cudaMemcpyHostToHost);
+    //cudaFree(BxDev);
+    cudaFree(xDev);
+    cudaFree(xNextDev);
+    cudaFree(BDev);
+    delete xNext;
 }
 
 int main(int argc, char **argv) {
@@ -202,30 +303,17 @@ int main(int argc, char **argv) {
     cudaEventRecord(start, 0);
 
     float *A = new float[N * N];
-    float *C = new float[N * N];
-    float *C2 = new float[N * N];
     float *f = new float[N];
     float *x = new float[N];
-    float *x2 = new float[N];
     for (int i = 0; i < N; i++) {
-        f[i] = i;
-        x[i] = x2[i] = 0;
+        f[i] = i + 1;
+        x[i] = 0;
     }
 
-    for (int i = 0; i < N; i++) {
-        for (int j = 0; j < N; j++) {
-            A[i * N + j] = 0;
-        }
-    }
-    float *ADev,  *CDev, *fDev, *xDev;
-    size_t pitchA, pitchC;
+    float *ADev;
+    size_t pitchA;
     cudaMallocPitch((void **) &ADev, &pitchA, N * sizeof(float), N);
-    cudaMallocPitch((void **) &CDev, &pitchC, N * sizeof(float), N);
-    cudaMalloc((void **) &fDev, N * sizeof(float));
-    cudaMalloc((void **) &xDev, N * sizeof(float));
     cudaMemcpy2D(ADev, pitchA, A, N * sizeof(float), N * sizeof(float), N, cudaMemcpyHostToDevice);
-    cudaMemcpy(fDev, f, N * sizeof(float), cudaMemcpyHostToDevice);
-    cudaMemcpy(xDev, x, N * sizeof(float), cudaMemcpyHostToDevice);
     
     dim3 threadsPerBlock(BLOCK_SIZE, BLOCK_SIZE);
     dim3 numBlocks(N / threadsPerBlock.x, N / threadsPerBlock.y);
@@ -233,32 +321,21 @@ int main(int argc, char **argv) {
     printf("Num blocks: (%d, %d)\n", numBlocks.x, numBlocks.y);
 
     fillRandom<<<numBlocks, threadsPerBlock>>>(ADev, N, pitchA);
-    //matMult<<<numBlocks, threadsPerBlock>>>(ADev, pitchA, ADev, pitchA, CDev, pitchC, N);
-    matVecMult<<<numBlocks, threadsPerBlock>>>(ADev, pitchA, fDev, xDev, N);
-    //diagMatAndMatMult<<<numBlocks, threadsPerBlock>>>(ADev, pitchA, ADev, pitchA, CDev, pitchC, N);
-    //invertDiagMat<<<numBlocks, threadsPerBlock>>>(ADev, pitchA);
-    multDiagMatAndVec<<<numBlocks, threadsPerBlock>>>(ADev, pitchA, fDev, xDev, N);
-
-    cudaMemcpy2D(A, N * sizeof(float), ADev, pitchA, N * sizeof(float), N, cudaMemcpyDeviceToHost);
-    cudaMemcpy2D(C, N * sizeof(float), CDev, pitchC, N * sizeof(float), N, cudaMemcpyDeviceToHost);
-    cudaMemcpy(f, fDev, N * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaMemcpy(x, xDev, N * sizeof(float), cudaMemcpyDeviceToHost);
+    printMatrixDev(ADev, pitchA, N);
+    findSolution(ADev, pitchA, f, x, N);
 
     cudaEventRecord(stop, 0);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&gpuTime, start, stop);
 
     cudaFree(ADev);
-    cudaFree(CDev);
-    cudaFree(fDev);
-    cudaFree(xDev);
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
     //printMatrix(A, N);
     printVector(x, N);
     //mult(A, A, C2, N);
-   // matVecMultClassic(A, f, x2, N);
+   // multMatVecClassic(A, f, x2, N);
    // assertVectors(x, x2, N);
 
     printf("Elapsed time: %.2f ms\n", gpuTime);
