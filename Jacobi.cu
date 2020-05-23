@@ -5,12 +5,17 @@
 #include <curand.h>
 
 #define EPS 0.0000001f
-#define BLOCK_SIZE 8
+#define BLOCK_SIZE 16
 
 #define CUDA_CALL(x) do { if((x)!=cudaSuccess) { \
     printf("[CUDA ERROR]: Error at %s:%d. ",__FILE__,__LINE__);\
     printf("Exit failure: %d\n", EXIT_FAILURE);\
     }} while(0)
+#define CURAND_CALL(x) do { if((x)!=CURAND_STATUS_SUCCESS) { \
+    printf("[CURAND ERROR]: Error at %s:%d\n",__FILE__,__LINE__);\
+    printf("Exit failure: %d\n", EXIT_FAILURE);\
+    }} while(0)
+    
 
 void printMatrix(float *A, int N) {
     for (int i = 0; i < N; i++) {
@@ -336,18 +341,18 @@ int main(int argc, char **argv) {
     printf("Num blocks: (%d, %d)\n", numBlocks.x, numBlocks.y);
 
     curandGenerator_t gen;
-    curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_XORWOW);
+    CURAND_CALL(curandCreateGenerator(&gen, CURAND_RNG_PSEUDO_XORWOW));
     unsigned long long clock = 1234ULL;
-    curandSetPseudoRandomGeneratorSeed(gen, clock);
+    CURAND_CALL(curandSetPseudoRandomGeneratorSeed(gen, clock));
     printf("Seed: %llu\n", clock);
     float *randDev;
     CUDA_CALL(cudaMalloc((void **) &randDev, N * N * sizeof(float)));
-    curandGenerateUniform(gen, randDev, N * N);
+    CURAND_CALL(curandGenerateUniform(gen, randDev, N * N));
 
     fillRandom<<<numBlocks, threadsPerBlock>>>(ADev, N, pitchA, randDev);
 
-    curandDestroyGenerator(gen);
-    cudaFree(randDev);
+    CURAND_CALL(curandDestroyGenerator(gen));
+    CUDA_CALL(cudaFree(randDev));
 
     findSolution(ADev, pitchA, f, x, N, threadsPerBlock, numBlocks);
 
